@@ -14,6 +14,7 @@ from torch.nn import CrossEntropyLoss, LayerNorm
 from torch.nn import CrossEntropyLoss, LayerNorm, MSELoss, BCEWithLogitsLoss
 from torch.nn.utils import skip_init
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any
+from collections import OrderedDict
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -24,8 +25,9 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList, GenerationConfig, ModelOutput
+from transformers import (BeitModel, BeitImageProcessor)
 
-from .configuration_chatglm import ChatGLMConfig
+from configuration_chatglm import ChatGLMConfig
 
 # flags required to enable jit fusion kernels
 
@@ -89,6 +91,34 @@ class PrefixEncoder(torch.nn.Module):
             past_key_values = self.embedding(prefix)
         return past_key_values
 
+class ImageEncoder(torch.nn.Module):
+    """
+    The torch.nn model to encode the prefix
+    Input shape after embedding: (batch-size, patch, img-hidden)
+    Output shape: (batch-size, patch, 2*layers*hidden)
+    """
+
+    def __init__(self, config: ChatGLMConfig,):
+        super().__init__()
+        self.image_embedding_projection = config.image_embedding_projection
+        self.image_embedding_model = None
+        if self.image_embedding_projection:
+            # Use a two-layer MLP to encode the prefix
+            kv_size = config.num_layers * config.kv_channels * config.multi_query_group_num * 2
+            # Use for alignment of image and text embedding
+            self.align = torch.nn.Sequential(
+                OrderedDict([("image_e_to_h",torch.nn.Linear(config.image_embedding_size, config.hidden_size)),
+                 ("activation",torch.nn.Tanh()),
+                ("image_h_to_kv",torch.nn.Linear(config.hidden_size, kv_size))])
+            )
+        else:
+            self.align = torch.nn.Linear(config.image_embedding_size,
+                                                config.num_layers * config.kv_channels * config.multi_query_group_num * 2)
+
+    def forward(self, prefix: torch.Tensor):
+        prefix_tokens = self.image_embedding_model(prefix).last_hidden_state
+        past_key_values = self.align(prefix_tokens)
+        return past_key_values
 
 def split_tensor_along_last_dim(
         tensor: torch.Tensor,
@@ -757,6 +787,8 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         self.output_layer = init_method(nn.Linear, config.hidden_size, config.padded_vocab_size, bias=False,
                                         dtype=config.torch_dtype, **init_kwargs)
         self.pre_seq_len = config.pre_seq_len
+        self.use_image = config.use_image
+        ## seems unuse
         self.prefix_projection = config.prefix_projection
         if self.pre_seq_len is not None:
             for param in self.parameters():
@@ -764,6 +796,17 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             self.prefix_tokens = torch.arange(self.pre_seq_len).long()
             self.prefix_encoder = PrefixEncoder(config)
             self.dropout = torch.nn.Dropout(0.1)
+            
+        ## add here image
+        if self.use_image:
+            self.image_encoder = ImageEncoder(config)
+            self.dropout = torch.nn.Dropout(0.1)
+            
+    def init_image_model(self, checkpoint):
+        self.image_encoder.image_embedding_model = BeitModel.from_pretrained(checkpoint)
+        for param in self.image_encoder.image_embedding_model.parameters():
+            param.requires_grad = False
+            
 
     def get_input_embeddings(self):
         return self.embedding.word_embeddings
@@ -782,6 +825,22 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         past_key_values = self.dropout(past_key_values)
         past_key_values = past_key_values.permute([2, 1, 0, 3, 4]).split(2)
         return past_key_values
+    
+    def get_image_prompt(self, image_tensors, device, dtype = torch.half):
+        image_tensors = image_tensors.to(device)
+        batch_size = image_tensors.size(0)
+        past_key_values = self.image_encoder(image_tensors).type(dtype)
+        patch_seq_length = past_key_values.size(1)
+        past_key_values = past_key_values.view(
+            batch_size,
+            patch_seq_length,
+            self.num_layers * 2,
+            self.multi_query_group_num,
+            self.kv_channels
+        )
+        past_key_values = self.dropout(past_key_values)
+        past_key_values = past_key_values.permute([2, 1, 0, 3, 4]).split(2)
+        return past_key_values
 
     def forward(
             self,
@@ -790,6 +849,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             attention_mask: Optional[torch.BoolTensor] = None,
             full_attention_mask: Optional[torch.BoolTensor] = None,
             past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+            image_tensors: Optional[torch.Tensor] = None,
             inputs_embeds: Optional[torch.Tensor] = None,
             use_cache: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
@@ -806,14 +866,31 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embedding(input_ids)
 
-        if self.pre_seq_len is not None:
-            if past_key_values is None:
+        # if self.pre_seq_len is not None:
+        #     if past_key_values is None:
+        #         past_key_values = self.get_prompt(batch_size=batch_size, device=input_ids.device,
+        #                                           dtype=inputs_embeds.dtype)
+        #     if attention_mask is not None:
+        #         attention_mask = torch.cat([attention_mask.new_ones((batch_size, self.pre_seq_len)),
+        #                                     attention_mask], dim=-1)
+        ## size of past_key_value 
+        if past_key_values is None:
+            if self.pre_seq_len is not None:
                 past_key_values = self.get_prompt(batch_size=batch_size, device=input_ids.device,
                                                   dtype=inputs_embeds.dtype)
+            if image_tensors is not None:
+                if self.pre_seq_len is not None:
+                    image_key_values = self.get_image_prompt(image_tensors=image_tensors, device=input_ids.device,
+                                                    dtype=inputs_embeds.dtype)
+                    past_key_values = tuple(torch.cat((prefix, image), dim = 1) 
+                                        for prefix, image in zip(past_key_values, image_key_values))
+                else:
+                    past_key_values = self.get_image_prompt(image_tensors=image_tensors, device=input_ids.device,
+                                                    dtype=inputs_embeds.dtype)
             if attention_mask is not None:
-                attention_mask = torch.cat([attention_mask.new_ones((batch_size, self.pre_seq_len)),
+                attention_mask = torch.cat([attention_mask.new_ones((batch_size, past_key_values[0].size(1))),
                                             attention_mask], dim=-1)
-
+        
         if full_attention_mask is None:
             if (attention_mask is not None and not attention_mask.all()) or (past_key_values and seq_length != 1):
                 full_attention_mask = self.get_masks(input_ids, past_key_values, padding_mask=attention_mask)
@@ -895,6 +972,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             self,
             input_ids: torch.LongTensor,
             past_key_values: Optional[torch.Tensor] = None,
+            image_tensors: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.Tensor] = None,
             use_cache: Optional[bool] = None,
@@ -911,6 +989,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
+            "image_tensors": image_tensors,
             "position_ids": position_ids,
             "attention_mask": attention_mask,
             "return_last_logit": True,
@@ -930,6 +1009,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             attention_mask: Optional[torch.Tensor] = None,
             full_attention_mask: Optional[torch.BoolTensor] = None,
             past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
+            image_tensors: Optional[torch.Tensor] = None,
             inputs_embeds: Optional[torch.Tensor] = None,
             labels: Optional[torch.Tensor] = None,
             use_cache: Optional[bool] = None,
@@ -952,6 +1032,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             attention_mask=attention_mask,
             full_attention_mask=full_attention_mask,
             past_key_values=past_key_values,
+            image_tensors=image_tensors,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
@@ -1014,10 +1095,12 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         response = response.replace("[[训练时间]]", "2023年")
         return response
 
-    def build_inputs(self, tokenizer, query: str, history: List[Tuple[str, str]] = None):
+    def build_inputs(self, tokenizer, query: str, image_tensors: torch.Tensor = None, history: List[Tuple[str, str]] = None):
         prompt = tokenizer.build_prompt(query, history=history)
         inputs = tokenizer([prompt], return_tensors="pt")
         inputs = inputs.to(self.device)
+        if image_tensors is not None:
+            inputs["image_tensors"] = image_tensors
         return inputs
 
     def build_stream_inputs(self, tokenizer, query: str, history: List[Tuple[str, str]] = None):
@@ -1033,7 +1116,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         return inputs
 
     @torch.inference_mode()
-    def chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, max_length: int = 8192, num_beams=1,
+    def chat(self, tokenizer, query: str, image_tensors: torch.Tensor = None, history: List[Tuple[str, str]] = None, max_length: int = 8192, num_beams=1,
              do_sample=True, top_p=0.8, temperature=0.8, logits_processor=None, **kwargs):
         if history is None:
             history = []
@@ -1042,7 +1125,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         logits_processor.append(InvalidScoreLogitsProcessor())
         gen_kwargs = {"max_length": max_length, "num_beams": num_beams, "do_sample": do_sample, "top_p": top_p,
                       "temperature": temperature, "logits_processor": logits_processor, **kwargs}
-        inputs = self.build_inputs(tokenizer, query, history=history)
+        inputs = self.build_inputs(tokenizer, query, image_tensors = image_tensors, history=history)
         outputs = self.generate(**inputs, **gen_kwargs)
         outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]
         response = tokenizer.decode(outputs)
