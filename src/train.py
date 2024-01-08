@@ -76,6 +76,13 @@ def find_target_modules(model, tuning_module = "all"):
                 
                 # Add the Layer Type to the Set of Unique Layers
                 unique_layers.add(name)
+        elif tuning_module == 'image_module':
+            if "Linear" in str(type(module)) and "transformer.encoder" not in name:
+                # Extract the Type of the Layer
+                layer_type = name.split('.')[-1]
+                
+                # Add the Layer Type to the Set of Unique Layers
+                unique_layers.add(name)
 
     # Return the Set of Unique Layers Converted to a List
     return list(unique_layers)
